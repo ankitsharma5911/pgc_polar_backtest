@@ -116,39 +116,27 @@ class IntradayBacktest:
         future_pickle_path = self.__future_pickle_path.format(date=self.current_date.date(), extn='pkl')
 
         if os.path.exists(future_parquet_path):
-            _future_lazy = pl.scan_parquet(future_parquet_path)
+            self.future_data = pl.read_parquet(future_parquet_path)
         elif os.path.exists(future_pickle_path):
-            _future_lazy = pl.from_pandas(pd.read_pickle(future_pickle_path)).lazy()
+            self.future_data = pl.from_pandas(pd.read_pickle(future_pickle_path))
         else:
             raise FileNotFoundError(f"Future data file not found for {self.index} on {self.current_date.date()}")
-
-        self.future_data_pl = (
-            _future_lazy
-            .select(["date_time", "open", "high", "low", "close"])
-            .with_columns(pl.col("date_time").cast(pl.Datetime))
-            .collect()
-        )
-
+            
+        self.future_data_pl = self.future_data.select(["date_time", "open", "high", "low", "close"]).with_columns(pl.col("date_time").cast(pl.Datetime))
         option_parquet_path = self.__option_pickle_path.format(date=self.current_date.date(), extn='parquet')
         option_pickle_path = self.__option_pickle_path.format(date=self.current_date.date(), extn='pkl')
-
+        
         if os.path.exists(option_parquet_path):
-            _options_lazy = pl.scan_parquet(option_parquet_path)
+            self.options_pl = pl.read_parquet(option_parquet_path)
         elif os.path.exists(option_pickle_path):
-            _options_lazy = pl.from_pandas(pd.read_pickle(option_pickle_path)).lazy()
+            self.options_pl = pl.from_pandas(pd.read_pickle(option_pickle_path))
         else:
             raise FileNotFoundError(f"Option data file not found for {self.index} on {self.current_date.date()}")
-
-        self.options_pl = (
-            _options_lazy
-            .select(["scrip", "date_time", "open", "high", "low", "close"])
-            .with_columns(pl.col("date_time").cast(pl.Datetime))
-            .filter(
-                (pl.col("date_time").dt.time() >= self.meta_start_time) &
-                (pl.col("date_time").dt.time() <= self.meta_end_time)
-            )
-            .collect()
-        )
+        
+        self.options_pl = self.options_pl.select(["scrip", "date_time", "open", "high", "low", "close"])
+        self.options_pl = self.options_pl.with_columns(pl.col("date_time").cast(pl.Datetime))
+        self.options_pl = self.options_pl.filter((pl.col("date_time").dt.time() >= self.meta_start_time) & (pl.col("date_time").dt.time() <= self.meta_end_time))
+        self.options_pl = self.options_pl  # Polars version for efficient filtering
         self.gap = self.get_gap()
         self.tick_size = self.TICKS.get(self.index.lower(), 0.05)
         
@@ -213,12 +201,11 @@ class IntradayBacktest:
             return cal_percent(round(future_price), 1)
         
     def _get_option_close(self, dt, scrip):
-        df = (
-            self.options_pl.lazy()
-            .filter((pl.col("date_time") == dt) & (pl.col("scrip") == scrip))
-            .select("close")
-            .collect()
-        )
+        df = self.options_pl.filter(
+            (pl.col("date_time") == dt) &
+            (pl.col("scrip") == scrip)
+        ).select("close")
+
         if df.is_empty():
             return None
         return df.item()
@@ -228,15 +215,11 @@ class IntradayBacktest:
         return round(round_func(value / self.tick_size) * self.tick_size, 2)
 
     def _get_single_leg_data(self, start_dt, end_dt, scrip, pandas=False):
-        data = (
-            self.options_pl.lazy()
-            .filter(
-                (pl.col('scrip') == scrip) &
-                (pl.col('date_time') >= start_dt) &
-                (pl.col('date_time') <= end_dt)
-            )
-            .select(["scrip", "date_time", "open", "high", "low", "close"])
-            .collect()
+        # Filter using Polars for better performance
+        data = self.options_pl.filter(
+            (pl.col('scrip') == scrip) &
+            (pl.col('date_time') >= start_dt) &
+            (pl.col('date_time') <= end_dt)
         )
         if pandas:
             return data.to_pandas()
@@ -285,14 +268,12 @@ class IntradayBacktest:
     def get_straddle_strike(self, start_dt, end_dt, sd=0, SDroundoff=False):
 
         future_pl = (
-            self.future_data_pl.lazy()
-            .filter(
+            self.future_data_pl.filter(
                 (pl.col("date_time") >= start_dt) &
                 (pl.col("date_time") <= end_dt)
             )
             .select(["date_time", "close"])
             .sort("date_time")
-            .collect()
         )
         if future_pl.is_empty():
             return (None,) * 6
@@ -361,16 +342,11 @@ class IntradayBacktest:
     def get_strangle_strike(self, start_dt, end_dt, om=None, target=None, check_inverted=False, tf=1):
 
         future_pl = (
-            self.future_data_pl.lazy()
-            .filter(
+            self.future_data_pl.filter(
                 (pl.col("date_time") >= start_dt) &
                 (pl.col("date_time") <= end_dt)
-            )
-            .select(["date_time", "close"])
-            .sort("date_time")
-            .collect()
-        )
-        options_lazy = self.options_pl.lazy()
+            ).select(["date_time", "close"]).sort("date_time"))
+        
         for row in future_pl.iter_rows(named=True):
             try:
                 current_dt = row["date_time"]
@@ -378,15 +354,11 @@ class IntradayBacktest:
                 one_om = self.get_one_om(future_price)
                 target = one_om * om if target is None else target
                 target_od = (
-                    options_lazy
-                    .filter(
+                    self.options_pl.filter(
                         (pl.col("date_time") == current_dt) &
                         (pl.col("close") >= target * tf)
-                    )
-                    .sort("close")
-                    .collect()
-                )
-
+                    ).sort("close"))
+                
                 ce_scrip = (
                     target_od.filter(pl.col("scrip").cast(pl.Utf8).str.ends_with("CE"))
                     .select("scrip")
@@ -455,33 +427,21 @@ class IntradayBacktest:
                  
     def get_ut_strike(self, start_dt, end_dt, om=None, target=None):
 
-        future_df = (
-            self.future_data_pl.lazy()
-            .filter(
-                (pl.col("date_time") >= start_dt) &
-                (pl.col("date_time") <= end_dt)
-            )
-            .select(["date_time", "close"])
-            .sort("date_time")
-            .collect()
-        )
-
+        future_df = (self.future_data_pl.filter(
+            (pl.col("date_time") >= start_dt) &
+            (pl.col("date_time") <= end_dt)
+        ).select(["date_time", "close"]).sort("date_time"))
+        
         if future_df.is_empty(): return (None,) * 6
-
-        options_lazy = self.options_pl.lazy()
+            
         for row in future_df.iter_rows(named=True):
             try:
                 current_dt = row["date_time"]
                 future_price = row["close"]
                 one_om = self.get_one_om(future_price)
                 tgt = one_om * om if target is None else target
-
-                target_od = (
-                    options_lazy
-                    .filter(pl.col("date_time") == current_dt)
-                    .select(["scrip", "close"])
-                    .collect()
-                )
+                
+                target_od = (self.options_pl.filter(pl.col("date_time") == current_dt).select(["scrip", "close"]))
                 if target_od.is_empty(): continue
                 
                 ce_df = (target_od.filter((pl.col("scrip").str.ends_with("CE")) & (pl.col("close") >= tgt)).sort("close"))
@@ -1419,51 +1379,34 @@ class WeeklyBacktest(IntradayBacktest):
         self.current_week_dates = sorted(set(([self.week_dates[0]] * (99 - len(self.week_dates)) + self.week_dates)[-from_dte : None if to_dte == 1 else -to_dte + 1]))
         self.__future_pickle_path, self.__option_pickle_path = self.get_future_option_path(index)
         
-        future_lazy_list = []
+        future_data_list = []
         for current_date in self.current_week_dates:
             future_parquet_path = self.__future_pickle_path.format(date=current_date.date(), extn='parquet')
             future_pickle_path = self.__future_pickle_path.format(date=current_date.date(), extn='pkl')
 
             if os.path.exists(future_parquet_path):
-                future_lazy_list.append(pl.scan_parquet(future_parquet_path))
+                future_data_list.append(pl.read_parquet(future_parquet_path))
             elif os.path.exists(future_pickle_path):
-                future_lazy_list.append(pl.from_pandas(pd.read_pickle(future_pickle_path)).lazy())
+                future_data_list.append(pl.from_pandas(pd.read_pickle(future_pickle_path)))
 
-        if not future_lazy_list:
+        if not future_data_list:
             raise FileNotFoundError(f"No future data files found for {self.index} for the given week.")
-
-        self.future_data_pl = (
-            pl.concat(future_lazy_list)
-            .select(["date_time", "open", "high", "low", "close"])
-            .with_columns(pl.col("date_time").cast(pl.Datetime))
-            .sort("date_time")
-            .collect()
-        )
-
-        options_lazy_list = []
+        
+        self.future_data_pl = pl.concat(future_data_list).sort("date_time").select(["date_time", "open", "high", "low", "close"])
+        self.future_data_pl = self.future_data_pl.with_columns(pl.col("date_time").cast(pl.Datetime))
+        option_data_list = []
         for current_date in self.current_week_dates:
             option_parquet_path = self.__option_pickle_path.format(date=current_date.date(), extn='parquet')
             option_pickle_path = self.__option_pickle_path.format(date=current_date.date(), extn='pkl')
 
             if os.path.exists(option_parquet_path):
-                options_lazy_list.append(pl.scan_parquet(option_parquet_path))
+                option_data_list.append(pl.read_parquet(option_parquet_path))
             elif os.path.exists(option_pickle_path):
-                options_lazy_list.append(pl.from_pandas(pd.read_pickle(option_pickle_path)).lazy())
-
-        self.options_pl = (
-            pl.concat(options_lazy_list)
-            .select(["scrip", "date_time", "open", "high", "low", "close"])
-            .with_columns(
-                pl.col("date_time").cast(pl.Datetime),
-                pl.col("scrip").cast(pl.Utf8),
-            )
-            .filter(
-                (pl.col("date_time").dt.time() >= start_time) &
-                (pl.col("date_time").dt.time() <= end_time)
-            )
-            .sort("date_time")
-            .collect()
-        )
+                option_data_list.append(pl.from_pandas(pd.read_pickle(option_pickle_path)))
+        
+        self.options_pl = pl.concat(option_data_list).sort("date_time").select(["scrip", "date_time", "open", "high", "low", "close"])
+        self.options_pl = self.options_pl.with_columns(pl.col("date_time").cast(pl.Datetime), pl.col("scrip").cast(pl.Utf8))
+        self.options_pl = self.options_pl.filter((pl.col("date_time").dt.time() >= start_time) & (pl.col("date_time").dt.time() <= end_time))
         
         self.gap = self.get_gap()
         self.tick_size = self.TICKS.get(index.lower(), 0.05)
@@ -1650,14 +1593,8 @@ class WeeklyBacktest(IntradayBacktest):
 
     def get_strangle_strike(self, start_dt, end_dt, om=None, target=None, check_inverted=False, tf=1):
         current_date = start_dt.date()
-        future_pl = (
-            self.future_data_pl.lazy()
-            .filter((pl.col("date_time") >= start_dt) & (pl.col("date_time") <= end_dt))
-            .select(["date_time", "close"])
-            .sort("date_time")
-            .collect()
-        )
-        options_lazy = self.options_pl.lazy()
+        future_pl = (self.future_data_pl.filter((pl.col("date_time") >= start_dt) &(pl.col("date_time") <= end_dt)).select(["date_time", "close"]).sort("date_time"))
+        
         for row in future_pl.iter_rows(named=True):
             current_dt = row["date_time"]
             if current_dt.date() != current_date:
@@ -1666,18 +1603,12 @@ class WeeklyBacktest(IntradayBacktest):
                 future_price = row["close"]
                 one_om = self.get_one_om(future_price)
                 target = one_om * om if target is None else target
-
-                target_od = (
-                    options_lazy
-                    .filter(
-                        (pl.col('date_time') == current_dt) &
-                        (pl.col('close') >= target * tf)
-                    )
-                    .sort('close')
-                    .with_columns(pl.col("scrip").cast(pl.Utf8))
-                    .collect()
-                )
-
+                
+                target_od = self.options_pl.filter(
+                    (pl.col('date_time') == current_dt) & 
+                    (pl.col('close') >= target * tf)
+                ).sort('close').with_columns(pl.col("scrip").cast(pl.Utf8))
+                
                 ce_series = target_od.filter(pl.col("scrip").str.ends_with("CE")).select("scrip").to_series()
                 pe_series = target_od.filter(pl.col("scrip").str.ends_with("PE")).select("scrip").to_series()
 
@@ -1685,30 +1616,29 @@ class WeeklyBacktest(IntradayBacktest):
                     continue
                 ce_scrip = ce_series.item(0)
                 pe_scrip = pe_series.item(0)
-
+                
                 ce_scrip_list = [ce_scrip,f"{get_strike(ce_scrip) - self.gap}CE",f"{get_strike(ce_scrip) + self.gap}CE"]
                 pe_scrip_list = [pe_scrip,f"{get_strike(pe_scrip) - self.gap}PE",f"{get_strike(pe_scrip) + self.gap}PE"]
-
+                
                 def get_option_price(scrip):
                     result = (
-                        options_lazy
+                        self.options_pl
                         .filter(
                             (pl.col("date_time") == current_dt) &
                             (pl.col("scrip") == scrip)
                         )
                         .select("close")
-                        .collect()
                     )
                     return result.item() if not result.is_empty() else 0
 
                 call_list_prices = [get_option_price(s) for s in ce_scrip_list]
                 put_list_prices  = [get_option_price(s) for s in pe_scrip_list]
-
+                
                 call = call_list_prices[0]
                 put = put_list_prices[0]
                 target_2 = target * 2 * tf
                 target_3 = target * 3
-
+                
                 min_diff = float("inf")
                 required_call, required_put = None, None
 
@@ -1717,7 +1647,7 @@ class WeeklyBacktest(IntradayBacktest):
                     min_diff = diff
                     required_call, required_put = call, put
                     required_call_idx, required_put_idx = 0, 0
-
+                    
                 for i in range(1, 3):
                     diff_put = abs(put_list_prices[i] - call)
                     if diff_put < min_diff and target_2 <= (put_list_prices[i] + call) <= target_3:
@@ -1736,9 +1666,13 @@ class WeeklyBacktest(IntradayBacktest):
     
                 ce_scrip = ce_scrip_list[required_call_idx]
                 pe_scrip = pe_scrip_list[required_put_idx]
-
-                ce_price = options_lazy.filter((pl.col("date_time") == current_dt) & (pl.col("scrip") == ce_scrip)).select("close").collect().item()
-                pe_price = options_lazy.filter((pl.col("date_time") == current_dt) & (pl.col("scrip") == pe_scrip)).select("close").collect().item()
+                
+                
+                ce_price = self.options_pl.filter((pl.col("date_time") == current_dt) & (pl.col("scrip") == ce_scrip)).select("close")
+                pe_price = self.options_pl.filter((pl.col("date_time") == current_dt) & (pl.col("scrip") == pe_scrip)).select("close")
+                                
+                ce_price = ce_price.item()
+                pe_price = pe_price.item()
                 # ---- inverted strike check ----
                 if get_strike(ce_scrip) < get_strike(pe_scrip) and check_inverted:
                     return self.get_straddle_strike(current_dt, end_dt)
@@ -1756,48 +1690,39 @@ class WeeklyBacktest(IntradayBacktest):
         return None, None, None, None, None, None    
                 
     def get_ut_strike(self, start_dt, end_dt, om=None, target=None):
-
+        
         current_date = start_dt.date()
-
-        future_df = (
-            self.future_data_pl.lazy()
-            .filter(
+        
+        future_df = (self.future_data_pl.filter(
                 (pl.col("date_time") >= start_dt) &
                 (pl.col("date_time") <= end_dt)
-            )
-            .select(["date_time", "close"])
-            .sort("date_time")
-            .collect()
-        )
-
-        options_lazy = self.options_pl.lazy()
+            ).select(["date_time", "close"]).sort("date_time"))
+        
         for rows in future_df.iter_rows(named=True):
             try:
                 current_dt = rows["date_time"]
                 future_price = rows["close"]
                 one_om = self.get_one_om(future_price)
                 target = one_om * om if target is None else target
-
-                target_od = (
-                    options_lazy
-                    .filter(
-                        (pl.col('date_time') == current_dt) &
-                        (pl.col('close') >= target)
-                    )
-                    .sort('close')
-                    .collect()
-                )
-
+                
+                # Filter options_pl using Polars
+                target_od = self.options_pl.filter(
+                    (pl.col('date_time') == current_dt) & 
+                    (pl.col('close') >= target)
+                ).sort('close')
+                
                 if target_od.is_empty():
                     continue
-
+                
                 ce_df = target_od.filter(pl.col('scrip').str.ends_with('CE'))
                 pe_df = target_od.filter(pl.col('scrip').str.ends_with('PE'))
-
+                
                 if ce_df.is_empty() or pe_df.is_empty():
                     continue
                 ce_scrip, ce_price = ce_df.select(["scrip", "close"]).row(0)
                 pe_scrip, pe_price = pe_df.select(["scrip", "close"]).row(0)
+                
+                
 
                 return ce_scrip, pe_scrip, ce_price, pe_price, future_price, current_dt
             except (IndexError, KeyError, ValueError, TypeError):
