@@ -105,7 +105,8 @@ class IntradayBacktest:
         ('BUY', 'DECAY'): math.ceil,
     }
 
-    token, group_id = '5156026417:AAExQbrMAPrV0qI8tSYplFDjZltLBzXTm1w', '-607631145'
+    token = os.getenv('TELEGRAM_BOT_TOKEN')
+    group_id = os.getenv('TELEGRAM_CHAT_ID')
 
     def __init__(self, pickle_path, index, current_date, dte, start_time, end_time):
         
@@ -173,9 +174,15 @@ class IntradayBacktest:
     
     def send_tg_msg(self, msg):
         print(msg)
+        if not self.token or not self.group_id:
+            return
         try:
-            requests.get(f'https://api.telegram.org/bot{self.token}/sendMessage?chat_id={self.group_id}&text={msg}')
-        except:
+            requests.get(
+                f'https://api.telegram.org/bot{self.token}/sendMessage',
+                params={'chat_id': self.group_id, 'text': msg},
+                timeout=10,
+            )
+        except requests.RequestException:
             pass
 
     def get_gap(self):
